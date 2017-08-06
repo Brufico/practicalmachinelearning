@@ -1,36 +1,897 @@
 ---
-title: "Practical Machine Learning Course Project"
-author: "Bruno Fischer Colonimos"
+title: "How Well Do You Exercise?"
+subtitle: "Practical Machine Learning - Course Project"
+author:  "Bruno Fischer Colonimos"
+abstract: |
+        The course project consists in building a prediction model for the quality of 
+        execution of a physical training exercise, based on accelerometer sensors data.
+        
+        * Words count: 1647 all included (counted with MS Word)
+        * gh-pages address: https://brufico.github.io/practicalmachinelearning/index.html
+        * Github repo address: https://github.com/Brufico/practicalmachinelearning
 date: "`r format(Sys.Date(), '%d %B %Y')`"
-output: 
+urlcolor: 'blue'
+linkcolor: 'red'
+fig_caption: yes
+output:
   html_document: 
-    keep_md: yes
     number_sections: yes
     theme: readable
     toc: yes
+    toc_depth: 4
+    keep_md: yes
 ---
 
+*********************************
+
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = FALSE, fig.show = "hold", fig.width = 2, fig.asp =1,fig.align = "center")
 ```
 
-## R Markdown
+<!-- We begin now with the R code. see below for the Report text (next HTML comment) -->
 
-This is a sample document, intended to test Github gh-pages.
-Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+```{r prelim, warning=FALSE, include=FALSE}
+# Preliminary code
+# ================
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+# libraries
+library(knitr, quietly = TRUE)
+library(caret, quietly = TRUE )
+library(parallel, quietly = TRUE)
+library(doParallel, quietly = TRUE)
+library(rpart, quietly = TRUE)
+library(randomForest, quietly = TRUE)
+library(MASS, quietly = TRUE)
 
-```{r cars}
-summary(cars)
+
+# Global options
+retrievedata <-  FALSE # if TRUE, forces new data download
+globalseed <- 9876 # unique seed for reproducibility
+percenttraining <- 0.75 # percentage of 'trainingset' to put in truetrainingset
+nfolds <- 5 # k = number of folds fork-folds crossvalidation
 ```
 
-## Including Plots
 
-You can also embed plots, for example:
+```{r dataget, cache=TRUE}
+datadir <- "data"
+traindatafile <- "pml_training.csv"
+testdatafile <- "pml_testing.csv"
+trainpath <- file.path(datadir, traindatafile)
+testpath <- file.path(datadir, testdatafile)
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+# Data location:
+urltrain <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+urltest <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+# Retrieving the data from the internet url (only once: set
+# `retrievedata == TRUE` to force downloading)
+if (!file.exists(trainpath) | retrievedata) {
+        download.file(urltrain, trainpath)
+        download.file(urltest, testpath)
+}
+
+# Read in the data
+# ----------------
+training <- read.csv(trainpath)
+testing <- read.csv(testpath)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+```{r datacleansplit, cache=TRUE}
+
+# get the variable names
+varnames <- colnames(training)
+
+
+#  Elimination of unwanted columns
+#  -------------------------------
+
+# Summary variable patterns
+sumpat <- c("kurtosis_","skewness_", "max_", "min_", "amplitude_", "var_", "avg_", "stddev_")
+
+# identify the summary columns
+lmatch <- Reduce(f = function(x,y) {x | y},
+                 init= FALSE,
+                 x = lapply(seq_along(sumpat),
+                            FUN= function(i) {grepl(sumpat[i], varnames)}))
+
+# remove summary columns
+training <- training[ ,!lmatch]
+# remove id + chronological info
+training <- training[-(1:7)]
+
+# create 2 versions of training: trainingcomp (including 'classe') and training (predictors only)
+trainingcomp <- training
+# remove "class" column and store apart
+trainclass <- training[[(ncol(training))]] # vector of response 'Classe'
+training <- training[-(ncol(training))]
+
+
+
+# do the same for the testing set:*************
+varnametst <- colnames(testing)
+
+# identify the summary columns
+lmatchtst <- Reduce(f = function(x,y) {x | y},
+                 init= FALSE,
+                 x = lapply(seq_along(sumpat),
+                            FUN= function(i) {grepl(sumpat[i], varnametst)}))
+
+
+# remove summary columns
+testing <- testing[!lmatchtst]
+# remove id + chronological info
+testing <- testing[-(1:7)]
+
+
+## checking results
+# Check for non-numeric variable types:
+notnumeric <- sum( !sapply(seq_along(training) ,
+                           FUN = function(i) {
+                                   is.numeric(training[[i]])
+                           }))
+
+# check for NAs
+numna <- sum(sapply(seq_along(training) ,
+                    FUN = function(i) {
+                            sum(is.na(training[[i]]))
+                    }
+))
+
+# Conclusion:
+# notnumeric
+# numna
+# Only numeric variables, no missing value
+
+
+
+# Splitting the training set ####################
+# From the given "training set", create a "truetrainingset" and a "validation set"
+
+set.seed(globalseed)
+intrain <- createDataPartition(y=trainclass,
+                               p= percenttraining,
+                               list = FALSE)
+
+truetrainingset <- trainingcomp[intrain,]
+validationset <- trainingcomp[-intrain,]
+```
+
+```{r exploration, cache=TRUE}
+# ________________________________________________
+# Table for the class variable
+tabclass <- local({
+        Frequency <-  table(truetrainingset$classe)
+        Rel.frequency <- round(prop.table(Frequency), 2)
+        rbind(Frequency, Rel.frequency)
+})
+# kable(tabclass)
+# ggplot(truetrainingset, aes(classe))+ geom_bar()
+
+# ________________________________________________
+# Graphical exploration with PCA
+
+# sum(is.na(truetrainingset$classe))
+
+truetrainingsetpreds <- subset(truetrainingset, select = -c(classe))
+prc <- prcomp(truetrainingsetpreds)
+
+# variance explained
+prcp <- prc$sdev ^ 2 / sum(prc$sdev ^ 2)
+sprcp <- cumsum(prcp)
+
+pcavarplot <- ggplot(data = data.frame(PC = seq_along(prcp),
+                                       pcvar = prcp,
+                                       cumpcvar = sprcp),
+                     aes(PC)) +
+        geom_line(aes(y = pcvar, linetype = "% variance"), color = "red" ) +
+        geom_line(aes(y = cumpcvar, linetype = "cumulative % variance"), color = "black" ) +
+        labs(x= "Principal components" , y="proportion variance",linetype = "")
+
+
+
+df <- as.data.frame(prc$x[ , 1:5])
+df <- cbind(df, data.frame(classe=truetrainingset$class))
+
+
+# random sample for a subset of df (for graphing without too many points)
+dfred <- df[sample(x = 1:nrow(df), size = 5000 ), ]
+```
+
+
+```{r modelbuildtools}
+# functions to record modeling attempts
+recordmod <- local({
+        recdf <- data.frame(
+                Name = character(),
+                Method = character(),
+                Preprocess = character(),
+                Best.tune = character(),
+                Accuracy.resampling = numeric(),
+                Accuracy.validation = numeric(),
+                Model.name = character(),
+                stringsAsFactors = FALSE)
+        reclist <- list(recdf)
+        init <- function(i = 1){ # i = the record "track"
+                recdf <- data.frame(
+                        Name = character(),
+                        Method = character(),
+                        Preprocess = character(),
+                        Best.tune = character(),
+                        Accuracy.resampling = numeric(),
+                        Accuracy.validation = numeric(),
+                        Model.name = character(),
+                        stringsAsFactors = FALSE)
+                reclist <- reclist
+                reclist[[i]] <- recdf
+                reclist <<- reclist # update list in parent env
+        }
+        new <- function(i = 1, # the record "track" = either an integer or a name (string)
+                        Name ="",
+                        Method = "" ,
+                        Preprocess ="" ,
+                        Best.tune ="",
+                        Accuracy.resampling = 0 ,
+                        Accuracy.validation = 0,
+                        Model.name = "") {
+                reclist <- reclist
+                recdf <- reclist[[i]]
+                newrow <- data.frame(Name = Name,
+                                     Method = Method,
+                                     Preprocess = Preprocess,
+                                     Best.tune = Best.tune,
+                                     Accuracy.resampling = Accuracy.resampling ,
+                                     Accuracy.validation = Accuracy.validation,
+                                     Model.name = Model.name,
+                                     stringsAsFactors = FALSE )
+                recdf <- rbind(recdf, newrow)
+                reclist[[i]] <- recdf # update
+                reclist <<- reclist # update
+        }
+        get <- function(i = 1) reclist[[i]]
+        # export funtions
+        list(init = init,
+             new=new,
+             get=get)
+})
+
+# initialize tracks 1 and 2
+recordmod$init(1)
+recordmod$init(2)
+
+```
+
+
+```{r modelbuildknn, cache=TRUE}
+# _______________________________
+# Knn
+# 
+
+
+set.seed(globalseed)
+modknn <- train(classe ~ . , data = truetrainingset,
+                method = "knn",
+                trControl = trainControl(method = "cv",
+                                         number = nfolds))
+```
+
+
+```{r modelbuildknnrec}
+
+# record attempt
+modl <- modknn
+cm <- confusionMatrix(data = predict( modl , newdata=validationset, type="raw"),
+                reference = validationset$classe)
+
+recordmod$new(Name = "KNN", 
+              Method = modl$method, 
+              Preprocess = "None",
+              Best.tune = paste0(colnames(modl$bestTune)[1], " = ", modl$bestTune[1]),
+              Accuracy.resampling = round(max(modl$results$Accuracy),3),
+              Accuracy.validation = round(cm$overal["Accuracy"],3),
+              Model.name = "modknn" )
+
+```
+
+```{r modelbuildknnpca, cache=TRUE}
+# _______________________________
+# Knn with pca
+# 
+set.seed(globalseed)
+modl <- modknn_pca <- train(classe ~ . , data = truetrainingset,
+                            method = "knn",
+                            preProcess = "pca",
+                            trControl = trainControl(method = "cv",
+                                                     number = nfolds))
+```
+
+
+```{r modelbuildknnpcarec}
+
+# record attempt
+cm <- confusionMatrix(data = predict( modl , newdata=validationset, type="raw"),
+                reference = validationset$classe)
+
+recordmod$new(Name = "KNN with PCA", 
+              Method = modl$method, 
+              Preprocess = "pca",
+              Best.tune = paste0(colnames(modl$bestTune)[1], " = ", modl$bestTune[1]),
+              Accuracy.resampling = round(max(modl$results$Accuracy),3),
+              Accuracy.validation = round(cm$overal["Accuracy"],3),
+              Model.name = "modknn_pca" )
+
+# recordmod$get()
+```
+
+
+
+```{r modelbuildcartpca, cache=TRUE}
+# _______________________________
+# Classification Tree
+# 
+
+set.seed(globalseed)
+# parallel processing
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+
+modl <- modcart_pca <- train(classe ~ . , data = truetrainingset,
+                             method = "rpart",
+                             preProcess= "pca",
+                             trControl = trainControl(method = "cv",
+                                                      number = nfolds))
+
+# stop parallel proc.
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+
+```{r modelbuildcartpcarec}
+
+# record attempt
+cm <- confusionMatrix(data = predict( modl , newdata=validationset, type="raw"),
+                reference = validationset$classe)
+
+recordmod$new(Name = "CART with PCA", 
+              Method = modl$method, 
+              Preprocess = "pca",
+              Best.tune = paste0(colnames(modl$bestTune)[1], " = ", 
+                                 round(modl$bestTune[1],4)),
+              Accuracy.resampling = round(max(modl$results$Accuracy),3),
+              Accuracy.validation = round(cm$overal["Accuracy"],3),
+              Model.name = "modcart_pca" )
+
+# recordmod$get()
+```
+
+```{r modelbuildrfpca, cache=TRUE, warning=FALSE, message=FALSE,error=FALSE}
+# _______________________________
+# Random Forest with PCA
+# 
+set.seed(globalseed)
+# parallel processing
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+
+modl <- modrf_pca <- train(classe ~ . , data = truetrainingset,
+                            method = "rf",
+                            preProcess= "pca",
+                            trControl = trainControl(method = "cv",
+                                                     number = nfolds,
+                                                     allowParallel = TRUE,
+                                                     # train to get class probs
+                                                     classProbs = TRUE)) 
+# stop parallel proc.
+stopCluster(cluster)
+registerDoSEQ()
+
+```
+
+
+```{r modelbuildrfpcarec}
+# record attempt
+cm <- confusionMatrix(data = predict( modl , newdata=validationset, type="raw"),
+                reference = validationset$classe)
+
+recordmod$new(Name = "Random Forest with PCA", 
+              Method = modl$method, 
+              Preprocess = "pca",
+              Best.tune = paste0(colnames(modl$bestTune)[1], " = ", modl$bestTune[1]),
+              Accuracy.resampling = round(max(modl$results$Accuracy),3),
+              Accuracy.validation = round(cm$overal["Accuracy"],3),
+              Model.name = "modrf_pca" )
+
+# recordmod$get()
+```
+
+```{r modelbuildqda, cache=TRUE}
+# _______________________________******
+# Quadratic Discriminant Analysis
+# 
+set.seed(globalseed)
+# parallel processing
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+
+modl <- modqda <- train(classe ~ . , data = truetrainingset,
+                            method = "qda",
+                            trControl = trainControl(method = "cv",
+                                                     number = nfolds,
+                                                     allowParallel = TRUE,
+                                                     # train to get class probs
+                                                     classProbs = TRUE)) 
+# stop parallel proc.
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+
+```{r modelbuildqdarec}
+
+# record attempt
+cm <- confusionMatrix(data = predict( modl , newdata=validationset, type="raw"),
+                reference = validationset$classe)
+
+recordmod$new(Name = "QDA", 
+              Method = modl$method, 
+              Preprocess = "None",
+              Best.tune = paste0(colnames(modl$bestTune)[1], " = ", modl$bestTune[1]),
+              Accuracy.resampling = round(max(modl$results$Accuracy),3),
+              Accuracy.validation = round(cm$overal["Accuracy"],3),
+              Model.name = "modqda" )
+
+# recordmod$get()
+```
+
+```{r modelbuildqdapca, cache=TRUE}
+# _______________________________******
+# Quadratic Discriminant Analysis with PCA
+# 
+set.seed(globalseed)
+# parallel processing
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+
+modl <- modqda_pca <- train(classe ~ . , data = truetrainingset,
+                            method = "qda",
+                            preProcess= "pca",
+                            trControl = trainControl(method = "cv",
+                                                     number = nfolds,
+                                                     allowParallel = TRUE,
+                                                     # train to get class probs
+                                                     classProbs = TRUE)) 
+# stop parallel proc.
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+
+```{r modelbuildqdapcarec}
+
+# record attempt
+cm <- confusionMatrix(data = predict( modl , newdata=validationset, type="raw"),
+                reference = validationset$classe)
+
+recordmod$new(Name = "QDA with PCA", 
+              Method = modl$method, 
+              Preprocess = "pca",
+              Best.tune = paste0(colnames(modl$bestTune)[1], " = ", modl$bestTune[1]),
+              Accuracy.resampling = round(max(modl$results$Accuracy),3),
+              Accuracy.validation = round(cm$overal["Accuracy"],3),
+              Model.name = "modqda_pca" )
+
+# recordmod$get()
+```
+
+```{r modelbuildldapca, cache=TRUE}
+# _______________________________******
+# Linear Discriminant Analysis with PCA
+# 
+set.seed(globalseed)
+# parallel processing
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+
+modl <- modlda_pca <- train(classe ~ . , data = truetrainingset,
+                            method = "lda",
+                            preProcess= "pca",
+                            trControl = trainControl(method = "cv",
+                                                     number = nfolds,
+                                                     allowParallel = TRUE,
+                                                     # train to get class probs
+                                                     # classProbs = TRUE
+                                                     )) 
+# stop parallel proc.
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+
+```{r modelbuildldapcarec}
+
+# record attempt
+cm <- confusionMatrix(data = predict( modl , newdata=validationset, type="raw"),
+                reference = validationset$classe)
+
+recordmod$new(Name = "LDA with PCA", 
+              Method = modl$method, 
+              Preprocess = "pca",
+              Best.tune = paste0(colnames(modl$bestTune)[1], " = ", modl$bestTune[1]),
+              Accuracy.resampling = round(max(modl$results$Accuracy),3),
+              Accuracy.validation = round(cm$overal["Accuracy"],3),
+              Model.name = "modlda_pca" )
+
+# recordmod$get()
+```
+
+```{r stacking_datasets}
+#_______________________________
+#
+# A) Predicting probabilities on training/validation/test sets for the three best methods
+
+# ----------
+# A1) predict probabilities (knn_pca) on:
+# training set
+tr_pknn_pca_pr <- predict(modknn_pca, newdata = truetrainingset, type= "prob")
+# rename columns to avoid duplicates
+colnames(tr_pknn_pca_pr) <- paste("knn", colnames(tr_pknn_pca_pr), sep=".")
+
+# Validation set
+v_pknn_pca_pr <- predict(modknn_pca, newdata = validationset, type= "prob")
+colnames(v_pknn_pca_pr) <- paste("knn", colnames(v_pknn_pca_pr), sep=".")
+
+# test set
+tst_pknn_pca_pr <- predict(modknn_pca, newdata = testing, type= "prob")
+colnames(tst_pknn_pca_pr) <- paste("knn", colnames(tst_pknn_pca_pr), sep=".")
+
+
+# ----------
+# A2) Same thing with (rf_pca) (Random Forest) on:
+# training set
+tr_prf_pca_pr <- predict(modrf_pca, newdata = truetrainingset, type= "prob")
+# rename columns to avoid duplicates
+colnames(tr_prf_pca_pr) <- paste("rf", colnames(tr_prf_pca_pr), sep=".")
+
+# Validation set
+v_prf_pca_pr <- predict(modrf_pca, newdata = validationset, type= "prob")
+colnames(v_prf_pca_pr) <- paste("rf", colnames(v_prf_pca_pr), sep=".")
+
+# test set
+tst_prf_pca_pr <- predict(modrf_pca, newdata = testing, type= "prob")
+colnames(tst_prf_pca_pr) <- paste("rf", colnames(tst_prf_pca_pr), sep=".")
+
+
+# ----------
+# A3) Same thing with (qda) on:
+# training set
+tr_pqda_pr <- predict(modqda, newdata = truetrainingset, type= "prob")
+# rename columns to avoid duplicates
+colnames(tr_pqda_pr) <- paste("qda", colnames(tr_pqda_pr), sep=".")
+
+# Validation set
+v_pqda_pr <- predict(modqda, newdata = validationset, type= "prob")
+colnames(v_pqda_pr) <- paste("qda", colnames(v_pqda_pr), sep=".")
+
+# test set
+tst_pqda_pr <- predict(modqda, newdata = testing, type= "prob")
+colnames(tst_pqda_pr) <- paste("qda", colnames(tst_pqda_pr), sep=".")
+
+```
+
+```{r stackcombine, eval = TRUE}
+
+# ----------
+# A4) combine these new covariates in dataframes
+# 
+# Training set
+dfstacktrain <- cbind(tr_pknn_pca_pr, tr_prf_pca_pr, tr_pqda_pr,
+                      data.frame(classe = truetrainingset$classe))
+# Validation set
+dfstackvalidation <- cbind(v_pknn_pca_pr, v_prf_pca_pr, v_pqda_pr,
+                      data.frame(classe = validationset$classe))
+# # Test set: The 'Classe' variable is absent
+dfstacktest <- cbind(tst_pknn_pca_pr, tst_prf_pca_pr, tst_pqda_pr)
+
+```
+
+```{r stackingfit1, cache = TRUE}
+# __________________________
+# B) fit a knn model
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+
+set.seed(globalseed)
+modl <- modstk_knn <- train(classe ~ . , data = dfstacktrain,
+                            method = "knn",
+                            # preProcess= "pca",
+                            trControl = trainControl(method = "cv",
+                                                     number = nfolds))
+
+stopCluster(cluster)
+registerDoSEQ()
+
+
+```
+
+```{r stackingfit1rec}
+# __________________________
+# C) accuracy estimations
+
+cm <- confusionMatrix(data = predict( modl , newdata=dfstackvalidation, type="raw"),
+                reference = dfstackvalidation$classe)
+
+# there is only one set of results to store 
+recordmod$new(i = 2,
+              Name = "Knn (combination)", 
+              Method = modl$method, 
+              Preprocess = "None",
+              Best.tune = paste0(colnames(modl$bestTune)[1], " = ", modl$bestTune[1]),
+              Accuracy.resampling = round(max(modl$results$Accuracy),5),
+              Accuracy.validation = round(cm$overal["Accuracy"],3),
+              Model.name = "modstk_knn" )
+```
+
+
+```{r stackingfit2, cache = TRUE}
+# __________________________
+# B) fit a knn model
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+
+set.seed(globalseed)
+modl <- modstk_rf <- train(classe ~ . , data = dfstacktrain,
+                            method = "rf",
+                            # preProcess= "pca",
+                            trControl = trainControl(method = "cv",
+                                                     number = nfolds))
+
+stopCluster(cluster)
+registerDoSEQ()
+
+```
+
+```{r stackingfit2rec}
+# __________________________
+# C) accuracy estimations
+
+cm <- confusionMatrix(data = predict( modl , newdata=dfstackvalidation, type="raw"),
+                reference = dfstackvalidation$classe)
+
+# there is only one set of results to store 
+recordmod$new(i = 2,
+              Name = "rf (combination)", 
+              Method = modl$method, 
+              Preprocess = "None",
+              Best.tune = paste0(colnames(modl$bestTune)[1], " = ", modl$bestTune[1]),
+              Accuracy.resampling = round(max(modl$results$Accuracy),5),
+              Accuracy.validation = round(cm$overal["Accuracy"],3),
+              Model.name = "modstk_rf" )
+```
+
+
+```{r finalpredict, eval = TRUE}
+# stacking with knn
+classprediction <- predict(modstk_knn, newdata=dfstacktest, type = "raw")
+
+# stacking with random forest
+classpredictionrf <- predict(modstk_rf, newdata=dfstacktest, type = "raw")
+
+# original random forest
+classpredictionrf0 <- predict(modrf_pca, newdata = testing, type= "raw")
+```
+
+
+
+
+
+<!-- Comment: Here begins the report display part -->
+
+Report Summary {-}
+===============
+This report describes the construction of a predictive model for the quality of execution of a training exercises - a classification model based on sensor data. After first selecting usable features and a short exploration, several models are trained and compared. After that, the best three models are combined in order to yield a better prediction, which out-of-sample accuracy is nearly perfect. 
+
+*********************************
+
+The Problem, and the Data  {#sec:problem}
+=========================
+
+The context  {#sec:context}
+-----------
+The aim of original study was to determine, based on sensor measures, if an exercise has been correctly performed. This is coded as A (correct) or B , C, D or E (different types of mistakes). We are required to predict the value of this "Classe", for a test set of sensor measures.
+
+Understanding the data  {#sec:understand}
+----------------------
+We have to define the work at hand and specify the possible features to use, accordig to the context of the study, the available dataset, and the required results: predicting the variable "classe" for 20 observations in the test set. 
+
+### The training dataset
+There are two types of observations, and six types of features
+
+* Two types of observational units:
+    * Each row of the data frame for which `new_window == no` represents a set of "raw" sensor measures made at the same point in time, and the "Classe", which qualifies the exercise repetition this observation belongs to.
+    * Each row such that `new_window == yes` represents a) a set of the same measurements, but also b) a set of summaries (average, std dev, min...etc) of these measurement, computed on a series of consecutive observations (a "window").
+* six types of features, namely:
+    * observation ID ('x')
+    * subject ('user_name')
+    * chronological information (raw_timestamp_part_1, raw_timestamp_part_2, cvtd_timestamp, new_window, num_window)
+    * raw sensor values (roll_belt, pitch_belt, ..., magnet_forearm_z)
+    * aggregate summaries of these values, computed on a window, and only defined if `new_window == yes`: (min_roll_belt , kurtosis_picth_arm, ..., var_yaw_dumbbell...)
+    * the 'Classe' of the exercise repetition the observation belongs to. 
+
+Remark: in [several posts of the forum](https://www.coursera.org/learn/practical-machine-learning/discussions/weeks/4/threads/awQPK214EeaseQ52nc1ePQ), students have pointed out that the summary information is not consistent with the available raw values. This might be because we only have here a subset of the original dataset (39242 observations).
+
+### The test dataset: What information is available at the time of prediction?
+
+The test dataset is similar, but:
+
+* Of course _"classe"_ is missing, ( we wish to predict its value ).
+* We have only 20 observations
+* None of these is such that `new_window == yes`, and the corresponding summaries __cannot be reconstructed__, as we do not have the other observations of the same "window".
+* we do not know other time-related  observations (of the same or from a previous window, for example)
+
+Consequences : usable features  {#sec:features}
+------------------------------
+Consequently, chronological and summary information is not usable (because not available when predicting). We can potentially use only: **raw sensor values** variables and `user_name`, but using `user_name` would be dubious, as new observations may come from new subjects, which are not part of the training dataset (It is the case in the "test set" with the subject named "charles"). Also, using `x` (the observation Id number), would be nonsensical.
+ 
+
+Data preparation {#sec:dataprep}
+----------------
+We eliminate from all datasets the variables that we can't use, and we keep all the rows. Then, 
+
+* `r ncol(truetrainingset)` features remain, all of them numeric. 
+* We observe that we don't have any missing value any more.
+
+
+Data splitting {#sec:datasplit}
+--------------
+
+We intend to use cross-validation in order to estimate out-of-sample accuracy and compare predictive models. Consequently we could do without a hold-out sample ([see discussion here](https://stats.stackexchange.com/questions/104713/hold-out-validation-vs-cross-validation)). However, we will have to combine (stack) predictors together in order to obtain the best accuracy. Due to the dual-step nature of this process, it is not very clear to us how we could do this while making sure that, each time, the predictions evaluated are be those made for observation which were __not used__ for training the model. (i.e. to estimate accuracy, __both__ a) prediction from primary models, b) training of a new model based on these predictions, and c) finally predictions of the new model, should be done on new observations). The  training/testing setup used is then the following:
+
+We have been supplied with :
+
+* a _test set_ of 20 observation. It will only be used in the final stage (i.e. the "quiz" part) of the project
+* a _training set_ of 19622 obsercations. This set will be randomly split (using `caret`) in:
+    * a _"true" training set_ (`r paste0(round(100 * percenttraining, 0), "%")` of the supplied original _"training set"_)
+    * a _"validation set"_ (`r paste0(round(100 * (1 - percenttraining), 0), "%")`), which will be used to
+        * get a reference point to compare the cross-validation accuracy estimations to,
+        * evaluate the accuracy of the "combined" predictive models. 
+     
+
+Exploration {#sec:exploration}
+===========
+
+In the (true) training set, the distribution of the classes to predict is the following:
+
+```{r displayclass}
+kable(tabclass, caption = "'Classe' distribution in the (true) training set")
+```
+
+To get some idea of the problem at hand, we have tried using Principal Components Analysis on the features, and graphically represent (a subset of) the training set, getting the following figures:
+
+```{r displaypcavarplot, fig.width=6, fig.asp=0.5, fig.cap="Variance explained by principal components "}
+pcavarplot
+```
+
+
+```{r displaypcagraph, fig.show= "hold", fig.width = 9, fig.cap="'Classe' patterns in principal components"}
+
+color_transparent <- function(color, alpha) {adjustcolor(color, alpha.f = alpha)}
+
+featurePlot(x=dfred[,c("PC1","PC2","PC3", "PC4", "PC5")],
+            y = dfred$classe,
+            plot="pairs", 
+            color=color_transparent(as.numeric(dfred$classe) , alpha = 0.1),
+            cex=0.15)
+
+```
+
+
+These figures suggest that:
+
+* A large part of the overall variance is captured by the first few principal components
+* There are definite class patterns differences that a predictive algorithm might pick up 
+* The Bayes boundaries of this problem are highly non-linear, thus, efficient algorithms will likely be 
+    a. non linear, and 
+    b. quite flexible (i.e. small k-value in a KNN model)
+* They also suggest that preprocessing the features with PCA is likely to be beneficial, to most algorithms, expecially those sensitive to high dimensionnality (knn). This will be confirmed later by our prediction attempts.
+
+
+Model-building {#sec:modelbuild}
+=================
+
+Test error estimates - K-fold cross-validation {#sec:cross}
+----------------------------------------------
+In order to compare classification methodes and tune their parameters, we need to estimate the test error. For reasons explained [above](#sec:datasplit), we primarily use k-fold crossvalidation, but we also keep a validation subsample. \ 
+The number of folds k will be __5__. (See James & al (2013), page 184 : _"Typically [...], one performs k-folds cross-validation using k = 5 or k = 10, as these values have been shown empirically to yield test error rates estimates that suffer neither from excessively high bias nor from very high variance"_ ). 
+
+Models training and comparison {#sec:traincomp}
+-------------------------------
+
+We now try and compare a nuber of common classification models. The results are shown in the table.
+
+```{r displayattempts}
+kable(recordmod$get()[ ,1:6] , row.names = FALSE)
+```
+
+These results show that the three independent and most efficient methods among our attempts are:
+
+* K-Nearest-Neighbours (with PCA preprocessing)
+* Random Forest (with PCA)
+* Quadratic Discriminant Analysis (without preprocessing)
+
+
+Models combination (via stacking) {#sec:combine}
+-------------------------------
+
+We now combine these models by stacking (Leeks (2015), lecture 4.3), i.e.:
+
+1. We predict class probabilities (on the training and the validation sample) with each model and generate 15 new covariates
+2. We train a model (on the training sample) using these new covariates
+3. We predict the class (on the validation sample) using this model and estimate out-of-sample performance.
+
+The results are: 
+
+```{r}
+# kable(t(stackresvect[1:6]))
+kable(recordmod$get(2)[ ,1:6] , row.names = FALSE )
+```
+
+Each of these two models have an estimated out-of-sample accuracy which is better than any of the previously tried models.
+
+
+Predicting test-set classes {#sec:predict}
+---------------------------
+
+We then use the stacked knn model to finally generate predictions for the given test set (quizz part).
+
+```{r}
+# names(classprediction) <- as.character(1:20)
+# kable(t(classprediction), caption = "knn (combination) " )
+# 
+# names(classpredictionrf) <- as.character(1:20)
+# kable(t(classpredictionrf), caption = "rf (combination) " )
+# 
+# 
+# names(classpredictionrf0) <- as.character(1:20)
+# kable(t(classpredictionrf0), caption = "rf (direct) " )
+
+```
+
+Entering these predictions in the quizz form results in a feedback stating a 95% accuracy (all predictions match save one).
+
+Concluding remarks {#sec:conclude}
+===================
+
+Our two final prediction algorithms both have an estimated accuracy very close to 100%. While this is in agreement with the mentor advice, it is very unlikely to be found in any real-life application, (as some posts have pointed out), especially as the authors of the original study claim accuracies around 75%.  
+
+
+*********************************
+
+Bibliography, References {-}
+========================
+
+Posts:\
+CrossValidated: _hold-out validation vs cross validation_: (https://stats.stackexchange.com/questions/104713/hold-out-validation-vs-cross-validation)
+
+Forum: _kurtosis values don't match_ ; https://www.coursera.org/learn/practical-machine-learning/discussions/weeks/4/threads/awQPK214EeaseQ52nc1ePQ
+
+
+Advice from the mentor:\
+Greski L. (2015): _Improving Performance of Random Forest in caret::train()_ ; https://github.com/lgreski/datasciencectacontent/blob/master/markdown/pml-randomForestPerformance.md
+
+Greski L. (2015): _Required Model Accuracy for Course project_ ; https://github.com/lgreski/datasciencectacontent/blob/master/markdown/pml-requiredModelAccuracy.md
+
+Greski L. (2015): _pml-gh Pages Setup_ ; https://github.com/lgreski/datasciencectacontent/blob/master/markdown/pml-ghPagesSetup.md
+
+Book:\
+James G, Witten D., Hastie T., Tibshirani R. (2013): _Introduction to Statistical Learning_ ; Springer.
+
+Course:\
+Leeks J. (2015):     _Practical Machine Learning_; Johns Hopkins University / Coursera
+
+Data derived from:\
+Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. (2013):
+ _Qualitative Activity Recognition of Weight Lifting Exercises_, 
+Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.
+[See more](http://groupware.les.inf.puc-rio.br/har#weight_lifting_exercises#ixzz4nrBaHTUn)
+
+
